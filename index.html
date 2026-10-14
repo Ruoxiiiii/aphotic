@@ -1,0 +1,1107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Aphotic — the deepest water</title>
+<style>
+/* the typeface, bundled — no network needed */
+@font-face{font-family:"Comfortaa";font-style:normal;font-weight:300;font-display:block;src:url("fonts/comfortaa-latin-300-normal.woff2") format("woff2");}
+@font-face{font-family:"Comfortaa";font-style:normal;font-weight:400;font-display:block;src:url("fonts/comfortaa-latin-400-normal.woff2") format("woff2");}
+@font-face{font-family:"Comfortaa";font-style:normal;font-weight:500;font-display:block;src:url("fonts/comfortaa-latin-500-normal.woff2") format("woff2");}
+@font-face{font-family:"Comfortaa";font-style:normal;font-weight:600;font-display:block;src:url("fonts/comfortaa-latin-600-normal.woff2") format("woff2");}
+</style>
+<script src="lib/p5.min.js"></script>
+<script src="lib/rita.min.js"></script>
+<style>
+  :root { box-sizing: border-box; }
+  *, *::before, *::after { box-sizing: inherit; }
+  html, body { height: 100%; margin: 0; background: #02040a; overflow: hidden; }
+  body { font-family: "Comfortaa", "Varela Round", system-ui, sans-serif; }
+  canvas { display: block; }
+  #composer {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    background: transparent; border: 0; outline: none; margin: 0; padding: 0;
+    color: transparent; caret-color: transparent; text-shadow: none;
+    font-size: 16px; -webkit-user-select: text; user-select: text;
+    z-index: 2; cursor: text;
+  }
+  #composer::selection { background: transparent; }
+  #snd {
+    position: fixed; top: 0; right: 0; z-index: 3;
+    padding: calc(14px + env(safe-area-inset-top, 0px)) 20px 14px 20px;
+    background: transparent; border: 0;
+    color: #dfeaf0; font-family: "Comfortaa", "Varela Round", system-ui, sans-serif;
+    font-size: 16px; letter-spacing: .06em;
+    opacity: .24; cursor: pointer; transition: opacity .4s ease;
+  }
+  #snd:hover, #snd:focus-visible { opacity: .7; outline: none; }
+  #snd.on { opacity: .48; }
+</style>
+</head>
+<body>
+<input id="composer" type="text" inputmode="text" autocomplete="off"
+       autocorrect="off" autocapitalize="none" spellcheck="false" maxlength="140"
+       aria-label="Say what moves. Press enter to release it into the water. Press enter on an empty line to clear.">
+<button id="snd" aria-label="Toggle ambient sound">&#9834; sound</button>
+<script>
+/* ------------------------------------------------------------------ *
+ *  APHOTIC — the deepest water, the deepest of the heart
+ *
+ *  Not a creature. A mood. You say what you feel; each word surfaces
+ *  for a breath in the serif, then its ink runs and bleeds into a slow
+ *  bloom of colour — spreading, drifting on deep currents, mingling
+ *  with the others, the way Frankenthaler let thinned pigment soak and
+ *  stain. The field's colour and motion come from the FEELING of your
+ *  words (their emotional weight, blended with their sound), and the
+ *  whole deep slowly shifts, sinks, and breathes.
+ *
+ *  Type. Enter releases it into the water. Empty enter clears.
+ * ------------------------------------------------------------------ */
+
+const RITA_OK = (typeof RiTa !== "undefined" && typeof RiTa.analyze === "function");
+const REDUCED = window.matchMedia &&
+                window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+
+/* Canvas letterSpacing is not in every browser (Safari, notably), and the
+   letters drifting apart is the whole of the fade here — so when it is
+   missing we lay the characters out by hand instead. */
+const LETTER_SPACING_OK = (() => {
+  try {
+    const c = document.createElement("canvas").getContext("2d");
+    c.letterSpacing = "10px";
+    return c.letterSpacing === "10px";
+  } catch (e) { return false; }
+})();
+
+/* ---- EROSION -------------------------------------------------------
+   A scratch canvas and a few noise masks, used to knock speckled holes
+   out of the letterforms so the type reads worn rather than printed. */
+const ERODE_OK = (() => { try { return !!document.createElement("canvas").getContext("2d"); }
+                          catch (e) { return false; } })();
+let _erode = null;
+function erodeCanvas(w, h) {
+  if (!ERODE_OK) return null;
+  if (!_erode) { const el = document.createElement("canvas");
+                 _erode = { el, ctx: el.getContext("2d") }; }
+  if (_erode.el.width < w || _erode.el.height < h) {
+    _erode.el.width = Math.max(_erode.el.width, w);
+    _erode.el.height = Math.max(_erode.el.height, h);
+  }
+  return _erode;
+}
+let _masks = null;
+function erodeMask(seed) {
+  if (!_masks) {
+    _masks = [];
+    const S = 128;
+    for (let m = 0; m < 5; m++) {
+      const el = document.createElement("canvas"); el.width = el.height = S;
+      const g = el.getContext("2d");
+      const img = g.createImageData(S, S), d = img.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const v = Math.random();
+        d[i] = d[i+1] = d[i+2] = 255;
+        // mostly transparent, with torn patches that will eat the strokes
+        d[i+3] = v > 0.72 ? 255 : v > 0.55 ? 150 : 0;
+      }
+      g.putImageData(img, 0, 0);
+      _masks.push(el);
+    }
+  }
+  return _masks[Math.floor(Math.abs(seed)) % _masks.length];
+}
+
+/* draw text centred on x, with `track` extra pixels between characters */
+function spacedText(ctx, text, x, y, track) {
+  const chars = [...text];
+  let total = 0;
+  const w = chars.map(ch => { const cw = ctx.measureText(ch).width; total += cw; return cw; });
+  total += track * Math.max(0, chars.length - 1);
+  let cx = x - total/2;
+  const align = ctx.textAlign;
+  ctx.textAlign = "left";
+  for (let i = 0; i < chars.length; i++) { ctx.fillText(chars[i], cx, y); cx += w[i] + track; }
+  ctx.textAlign = align;
+}
+const md = () => Math.min(width, height);
+const hsla = (h, s, l, a) => `hsla(${((h % 360) + 360) % 360},${s.toFixed(1)}%,${l.toFixed(1)}%,${a})`;
+const lerpHue = (a, b, t) => { const d = ((b - a + 540) % 360) - 180; return (a + d * t + 360) % 360; };
+
+const VOWELS = new Set(["aa","ae","ah","ao","aw","ay","eh","er","ey","ih","iy","ow","oy","uh","uw"]);
+const PLOS   = new Set(["p","b","t","d","k","g","ch","jh"]);
+const FRIC   = new Set(["f","v","s","z","sh","zh","th","dh","hh"]);
+const NAS    = new Set(["m","n","ng"]);
+const LIQ    = new Set(["l","r","w","y"]);
+
+/* ---- an affective vocabulary: some words carry their own weather.
+        each may set hue (0-360) and any of warmth/energy/lumin/weight/sat
+        (0..1); the rest is filled in from the word's sound. ------------ */
+const AFFECT = {};
+const aff = (arr, d) => arr.forEach(w => AFFECT[w] = d);
+aff(["love","loved","beloved","tender","tenderness","warm","warmth","embrace","held","hold","home","belonging","cherish","comfort","comforted","safe","close","gold","golden","honey","dear","kind","care"],
+    {hue:34, warmth:0.9, lumin:0.72, energy:0.32, weight:0.35, sat:0.5});
+aff(["longing","long","yearn","yearning","ache","aching","miss","missing","desire","wistful","nostalgia","nostalgic","distant","far","memory","remember","dream","dreaming","wonder","tender"],
+    {hue:276, warmth:0.55, lumin:0.55, energy:0.34, weight:0.46, sat:0.42});
+aff(["grief","grieve","grieving","sorrow","sad","sadness","mourn","mourning","loss","lost","empty","emptiness","hollow","weep","weeping","tears","cry","crying","ache","gone","fade","faded"],
+    {hue:210, warmth:0.22, lumin:0.36, energy:0.28, weight:0.72, sat:0.24});
+aff(["lonely","alone","loneliness","abandoned","forsaken","apart","silence","unseen","forgotten"],
+    {hue:224, warmth:0.24, lumin:0.34, energy:0.26, weight:0.66, sat:0.24});
+aff(["fear","afraid","dread","terror","cold","freezing","dark","darkness","night","abyss","deep","deeper","deepest","drown","drowning","sink","sinking","pressure","black","void","nothing","below"],
+    {hue:232, warmth:0.16, lumin:0.24, energy:0.5, weight:0.86, sat:0.3});
+aff(["calm","peace","peaceful","still","stillness","quiet","hush","breathe","breath","rest","ease","serene","float","floating","slow","gentle","soft","drift"],
+    {hue:172, warmth:0.5, lumin:0.56, energy:0.15, weight:0.4, sat:0.34});
+aff(["rage","anger","angry","fury","burn","burning","fire","hot","wild","storm","violent","fierce","tear","break"],
+    {hue:10, warmth:0.85, lumin:0.72, energy:0.95, weight:0.5, sat:0.62});
+aff(["hope","hopeful","light","bright","dawn","rise","rising","open","free","alive","joy","glow","shine","surface","breathe"],
+    {hue:48, warmth:0.72, lumin:0.86, energy:0.5, weight:0.24, sat:0.5});
+/* the existential vocabulary (Yalom's four ultimate concerns) */
+aff(["death","mortal","mortality","finite","finitude","ending","dying","transience","perish","borrowed","certain"],
+    {hue:218, warmth:0.2, lumin:0.3, energy:0.3, weight:0.82, sat:0.26});
+aff(["freedom","free","choice","choosing","will","responsibility","groundless","ground","unmade","decide","own"],
+    {hue:196, warmth:0.45, lumin:0.5, energy:0.42, weight:0.5, sat:0.34});
+aff(["isolation","isolated","separate","separateness","aloneness","solitude","unbridged","unreachable","distance","other","apart"],
+    {hue:250, warmth:0.3, lumin:0.4, energy:0.24, weight:0.6, sat:0.3});
+aff(["meaning","meaningless","meaninglessness","purpose","pattern","sense","indifferent","unanswered","wordless","absurd","void"],
+    {hue:264, warmth:0.38, lumin:0.44, energy:0.3, weight:0.58, sat:0.34});
+aff(["awareness","awakened","encounter","presence","existence","courage","honest","witness","held","living","shared","being"],
+    {hue:160, warmth:0.6, lumin:0.66, energy:0.3, weight:0.36, sat:0.4});
+/* the motion set — every verb a participle, grouped by how it moves.
+   The water and the creatures share these groups: the same kinds of
+   motion run through both. */
+aff(["breaking","striking","dashing","lashing","hurling","roaring","thundering","seizing",
+     "sweeping","beating","drowning","heaping","rebounding","snatching","licking",
+     "threatening","overtaking","hissing","crying","gnawing","attacking","snapping",
+     "rousing","struggling","floundering","throwing","arming","awaiting","opening"],
+    {hue:248, warmth:0.29, lumin:0.44, energy:0.91, weight:0.73, sat:0.47});  // violent, seizing
+aff(["rolling","flowing","rushing","curling","spreading","swinging","sinking","slipping",
+     "heaving","rising","running","drifting","bearing","draining","setting","closing",
+     "swimming","swarming","sporting","jumping","leaping","fleeing","cruising","grazing",
+     "following","ranging","roaming","hunting","dragging","moving","turning","fanning",
+     "bathing","springing"],
+    {hue:192, warmth:0.53, lumin:0.6, energy:0.56, weight:0.44, sat:0.39});   // moving, alive
+aff(["gliding","trailing","floating","wheeling","soaring","flying","sailing","spouting",
+     "playing","singing","fluttering","shining","sparkling","glittering","flaming",
+     "bewitching","breathing","darting"],
+    {hue:172, warmth:0.61, lumin:0.81, energy:0.4, weight:0.28, sat:0.45});   // luminous, weightless
+aff(["brooding","hanging","reigning","pervading","deepening","thickening","whispering",
+     "sobbing","rumbling","creeping","whistling","ensuing","stretching","lurking",
+     "emerging","resting","inhabiting","subsisting","flourishing","darkening",
+     "disappearing","dying","uttering","eyeing"],
+    {hue:239, warmth:0.29, lumin:0.33, energy:0.17, weight:0.74, sat:0.28});  // brooding, unseen
+
+let stains = [];
+let inks = [];               // words surfacing, then bleeding
+let motes = [];
+let composer, composing = "";
+let firstCommit = false;
+/* whether the PERSON has released a word — the deep's own words must not
+   count, or the invitation would disappear on its own before anyone
+   has typed anything */
+let userSaid = false;
+let startT = 0, tSec = 0;
+/* the piece waits, dark and silent, until the sound is actually running,
+   so the opening words and the first sound arrive together */
+let pieceBegun = false, bootT = 0;
+
+/* the invitation that waits by the cursor before anything is said */
+const PROMPT = "what moves in you";
+
+/* The lines the piece opens with, before they sink. Each is smaller and
+   arrives a beat later than the one above it, so the opening descends
+   as it is read, then goes down together. */
+const OPENING = [
+  { text: "deepest water.",     size: 0.050, delay: 0.0, drag: 0.00 },
+  { text: "deeper, the heart.", size: 0.033, delay: 1.3, drag: 0.10 },
+  { text: "still and moving.",  size: 0.025, delay: 2.7, drag: 0.22 }
+];
+
+/* ---- AMBIENT TEXT ------------------------------------------------- *
+ *  A slow poem of the deep, flowing on its own. THE MOTION SET: every
+ *  phrase is a noun and a verb, and every verb is a PRESENT PARTICIPLE
+ *  — rolling, breathing, brooding, gliding. Nothing has happened and
+ *  nothing is finished; it is all going on now, and goes on while you
+ *  watch. Not an account of the sea but an environment of the present.
+ *  Two currents run through it: the water moving, and the creatures
+ *  moving in it, from whales down to polyps and the nameless monsters.
+ *
+ *  SOURCE — measured, not invented. Mined from ~1,184,000 words of
+ *  public-domain sea literature: Moby-Dick (Melville), Twenty Thousand
+ *  Leagues Under the Sea and The Mysterious Island (Verne), The Voyage
+ *  of the Beagle (Darwin), Two Years Before the Mast (Dana), The
+ *  Sea-Wolf (London), Heart of Darkness and Typhoon (Conrad), Leaves of
+ *  Grass (Whitman).
+ *
+ *  Method: scan for every ocean noun and every creature noun, collect
+ *  the verb that follows, confirm the part of speech with RiTa (the
+ *  same library this sketch uses), drop narrative verbs and copulas.
+ *  Every phrase occurred VERBATIM in the texts; the verbs were then
+ *  conjugated to the participle with RiTa, which is why some read in a
+ *  tense the books did not use ("sea broke" became "sea breaking").
+ *  Excluded by hand: Verne's "Nautilus" (a submarine, not a mollusc),
+ *  "rays" where it means light, and human activity (whale hunting).
+ *  Script: poetic_vocabulary.js
+ * ------------------------------------------------------------------- */
+const AMBIENT = [
+  /* the water, moving */
+  "waves rolling", "ocean rolling", "sea rolling", "sea heaving",
+  "sea rising", "water rising", "waters rising", "swell swinging",
+  "waves heaping", "sea breaking", "surf breaking", "waves breaking",
+  "sea dashing", "current dashing", "sea beating", "surf beating",
+  "waves beating", "wave sweeping", "sea sweeping", "waves rebounding",
+  "tide breaking", "sea running", "water flowing", "waters flowing",
+  "water rushing", "sea rushing", "tides drifting", "sea drifting",
+  "current bearing", "waters draining", "tide setting", "sea roaring",
+  "surf roaring", "billows thundering", "deep rumbling", "water hissing",
+  "water crying", "dark whispering", "deep sobbing", "water shining",
+  "waves shining", "sea sparkling", "ocean sparkling", "water glittering",
+  "sea glittering", "sea flaming", "water fluttering", "gloom brooding",
+  "gloom hanging", "silence hanging", "silence reigning", "silence pervading",
+  "darkness deepening", "darkness creeping", "darkness whistling", "darkness ensuing",
+  "waters thickening", "waves thickening", "deep breathing", "water sinking",
+  "night slipping", "shadows darting", "shadow stretching", "waters stretching",
+  "current seizing", "current snatching", "maelstrom lashing", "billows licking",
+  "wave drowning", "wave hurling", "waves threatening", "tide overtaking",
+  "water bewitching", "deep swimming", "swell bathing", "sea closing",
+
+  /* the creatures, moving in it */
+  "whale swimming", "whales swarming", "whales sporting", "whale cruising",
+  "whales jumping", "whales spouting", "whale striking", "whales striking",
+  "whales gnawing", "whales running", "whales disappearing", "leviathan dying",
+  "monster emerging", "monster rushing", "monster rousing", "monster attacking",
+  "monster sailing", "beast throwing", "beasts ranging", "creature struggling",
+  "creatures roaming", "creatures rising", "creatures hunting", "creature uttering",
+  "creature resting", "fish swimming", "fishes swimming", "fish leaping",
+  "fish fleeing", "fish lurking", "fish moving", "fishes struggling",
+  "shoals grazing", "shoal disappearing", "shark swimming", "shark floundering",
+  "dolphin following", "serpents gliding", "serpent snapping", "seals inhabiting",
+  "tentacles trailing", "tentacles springing", "medusae floating", "cuttlefish swimming",
+  "molluscs moving", "corals springing", "corals flourishing", "coral darkening",
+  "zoophytes flourishing", "crabs dragging", "crab turning", "infusoria subsisting",
+  "jaws opening", "jaws awaiting", "tail beating", "tail fanning",
+  "fins struggling", "albatross gliding", "bird wheeling", "bird soaring",
+  "bird eyeing", "gulls flying", "birds fluttering", "birds crying",
+  "birds singing", "birds swimming", "birds disappearing", "cormorant playing"
+];
+
+/* Corpus weight: how often each word appears inside one of these
+   phrases — not how common it is in general prose, so "crying" counts
+   only when the water or a bird cries. This drives size and clarity:
+   the sea's habitual motions arrive large and present, its rarest
+   (maelstrom lashing, sea flaming, tentacles springing) stay small,
+   faint, and half-seen. */
+const CORPUS_FREQ = {
+  "sea": 39, "swimming": 34, "breaking": 33, "beating": 28, "rising": 23, "water": 21,
+  "rolling": 18, "rushing": 18, "waves": 13, "running": 12, "flowing": 12, "silence": 11,
+  "whales": 10, "waters": 9, "reigning": 9, "disappearing": 9, "struggling": 9, "dashing": 8,
+  "crying": 8, "fish": 7, "birds": 7, "sweeping": 6, "roaring": 6, "shining": 6,
+  "fluttering": 6, "whale": 6, "striking": 6, "surf": 5, "tide": 5, "darkness": 5,
+  "monster": 5, "inhabiting": 5, "ocean": 4, "current": 4, "drifting": 4, "deep": 4,
+  "sparkling": 4, "glittering": 4, "hanging": 4, "thickening": 4, "creature": 4, "creatures": 4,
+  "gliding": 4, "springing": 4, "corals": 4, "flourishing": 4, "jaws": 4, "tail": 4,
+  "heaving": 3, "wave": 3, "setting": 3, "gloom": 3, "fishes": 3, "bird": 3,
+  "swell": 2, "billows": 2, "brooding": 2, "deepening": 2, "stretching": 2, "bewitching": 2,
+  "cruising": 2, "spouting": 2, "leaping": 2, "moving": 2, "shark": 2, "tentacles": 2,
+  "cuttlefish": 2, "molluscs": 2, "crabs": 2, "opening": 2, "flying": 2, "swinging": 1,
+  "heaping": 1, "rebounding": 1, "tides": 1, "bearing": 1, "draining": 1, "thundering": 1,
+  "rumbling": 1, "whispering": 1, "dark": 1, "sobbing": 1, "flaming": 1, "pervading": 1,
+  "creeping": 1, "whistling": 1, "ensuing": 1, "breathing": 1, "sinking": 1, "slipping": 1,
+  "night": 1, "darting": 1, "shadows": 1, "shadow": 1, "seizing": 1, "snatching": 1,
+  "lashing": 1, "maelstrom": 1, "licking": 1, "drowning": 1, "hurling": 1, "threatening": 1,
+  "overtaking": 1, "bathing": 1, "closing": 1, "swarming": 1, "sporting": 1, "jumping": 1,
+  "gnawing": 1, "dying": 1, "leviathan": 1, "emerging": 1, "rousing": 1, "attacking": 1,
+  "sailing": 1, "throwing": 1, "beast": 1, "ranging": 1, "beasts": 1, "roaming": 1,
+  "hunting": 1, "uttering": 1, "resting": 1, "fleeing": 1, "lurking": 1, "grazing": 1,
+  "shoals": 1, "shoal": 1, "floundering": 1, "following": 1, "dolphin": 1, "serpents": 1,
+  "snapping": 1, "serpent": 1, "seals": 1, "trailing": 1, "floating": 1, "medusae": 1,
+  "darkening": 1, "coral": 1, "zoophytes": 1, "dragging": 1, "turning": 1, "crab": 1,
+  "subsisting": 1, "infusoria": 1, "awaiting": 1, "fanning": 1, "fins": 1, "albatross": 1,
+  "wheeling": 1, "soaring": 1, "eyeing": 1, "gulls": 1, "singing": 1, "playing": 1,
+  "cormorant": 1, "hissing": 1
+};
+
+/* How prominent a word should be. Two sources, combined:
+   its weight in the sea-literature corpus (log-scaled, so "water" at 166
+   looms over "icy" at 3 without swamping it), plus how often it has
+   surfaced here in this session — so a word you keep typing grows too. */
+const CORPUS_MAX = Math.max(...Object.values(CORPUS_FREQ));
+function freqWeight(key, sessionCount) {
+  const c = CORPUS_FREQ[key] || 0;
+  const corpus = c ? Math.log(1 + c) / Math.log(1 + CORPUS_MAX) : 0;  // 0..1
+  return 1 + corpus * 7 + Math.min(sessionCount - 1, 4) * 0.9;
+}
+/* how many times each word has surfaced here — feeds the above */
+let freq = {};
+let lastCommitT = -999, lastAmbientT = 0, ambientGap = 8;
+
+/* The light from above belongs to the words: it gathers as they surface
+   and goes out as they bleed away. `lightNow` eases toward how much word
+   is in the water; `lightSurge` is the brief lift each new one brings. */
+let lightNow = 0, lightSurge = 0;
+
+const REST = { warmth:0.5, energy:0.28, lumin:0.5, weight:0.5, hue:214 };
+let mood   = { warmth:0.5, energy:0.28, lumin:0.5, weight:0.5, hue:214 };
+let target = { warmth:0.5, energy:0.28, lumin:0.5, weight:0.5, hue:214 };
+
+/* ================================================================== *
+ *  SOUND — drone + water, and a soft bloom for each word
+ * ================================================================== */
+const Sound = {
+  ctx:null, master:null, started:false, muted:false,
+  dlp:null, droneA:null, droneB:null, noiseFilter:null, noiseGain:null, conv:null,
+  init() {
+    if (this.started) return;
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    try {
+      const ctx = new AC(); this.ctx = ctx;
+      const master = ctx.createGain(); master.gain.value = 0.0001; master.connect(ctx.destination); this.master = master;
+      const conv = ctx.createConvolver(); conv.buffer = this.makeIR(ctx, 3.0, 2.6);
+      const revGain = ctx.createGain(); revGain.gain.value = 0.7; conv.connect(revGain); revGain.connect(master); this.conv = conv;
+      /* The bed. A 52Hz fundamental alone is inaudible on laptop and
+         phone speakers, so the drone is voiced with partials above it —
+         the low end is felt where it can be, and heard where it cannot. */
+      const droneGain = ctx.createGain(); droneGain.gain.value = 0.17;
+      const dlp = ctx.createBiquadFilter(); dlp.type = "lowpass"; dlp.frequency.value = 520;
+      droneGain.connect(dlp); dlp.connect(master); this.dlp = dlp;
+      const a = ctx.createOscillator(); a.type = "sine";     a.frequency.value = 52;
+      const b = ctx.createOscillator(); b.type = "triangle"; b.frequency.value = 78;
+      const bg = ctx.createGain(); bg.gain.value = 0.34; b.connect(bg); bg.connect(droneGain);
+      a.connect(droneGain); a.start(); b.start(); this.droneA = a; this.droneB = b;
+      // the audible partials: an octave and a twelfth above the fundamental
+      const c = ctx.createOscillator(); c.type = "sine"; c.frequency.value = 104;
+      const cg = ctx.createGain(); cg.gain.value = 0.3; c.connect(cg); cg.connect(droneGain);
+      const d = ctx.createOscillator(); d.type = "sine"; d.frequency.value = 156;
+      const dg = ctx.createGain(); dg.gain.value = 0.16; d.connect(dg); dg.connect(droneGain);
+      c.start(); d.start(); this.droneC = c; this.droneD = d;
+      // a slow swell, so the bed breathes rather than sitting flat
+      const br = ctx.createOscillator(); br.frequency.value = 0.045;
+      const brg = ctx.createGain(); brg.gain.value = 0.055;
+      br.connect(brg); brg.connect(droneGain.gain); br.start();
+      const src = ctx.createBufferSource(); src.buffer = this.makeNoise(ctx, 2.4); src.loop = true;
+      const nf = ctx.createBiquadFilter(); nf.type = "lowpass"; nf.frequency.value = 700; nf.Q.value = 0.7;
+      const ng = ctx.createGain(); ng.gain.value = 0.095; src.connect(nf); nf.connect(ng); ng.connect(master);
+      const lfo = ctx.createOscillator(); lfo.frequency.value = 0.05;
+      const lfg = ctx.createGain(); lfg.gain.value = 160; lfo.connect(lfg); lfg.connect(nf.frequency); lfo.start();
+      src.start(); this.noiseFilter = nf; this.noiseGain = ng;
+      this.started = true;
+      const now = ctx.currentTime;
+      master.gain.setValueAtTime(0.0001, now);
+      master.gain.exponentialRampToValueAtTime(this.muted ? 0.0001 : 0.5, now + 2.6);
+    } catch (e) {}
+  },
+  resume() { if (this.ctx && this.ctx.state === "suspended") this.ctx.resume(); },
+  makeNoise(ctx, sec) {
+    const n = Math.floor(ctx.sampleRate*sec), buf = ctx.createBuffer(1, n, ctx.sampleRate);
+    const d = buf.getChannelData(0); let last = 0;
+    for (let i=0;i<n;i++){ const w = Math.random()*2-1; last=(last+0.02*w)/1.02; d[i]=last*3.2; }
+    return buf;
+  },
+  makeIR(ctx, sec, decay) {
+    const n = Math.floor(ctx.sampleRate*sec), buf = ctx.createBuffer(2, n, ctx.sampleRate);
+    for (let ch=0;ch<2;ch++){ const d = buf.getChannelData(ch);
+      for (let i=0;i<n;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/n, decay); }
+    return buf;
+  },
+  setMood(m) {
+    if (!this.started || !this.ctx) return; const now = this.ctx.currentTime;
+    try {
+      this.dlp.frequency.setTargetAtTime(380 + m.energy*420 + m.warmth*140, now, 0.8);
+      this.noiseFilter.frequency.setTargetAtTime(520 + m.energy*1500 + m.lumin*340, now, 0.8);
+      this.noiseGain.gain.setTargetAtTime(0.07 + m.energy*0.055, now, 0.8);
+      const f0 = 44 + m.weight*16 - m.warmth*4;
+      this.droneA.frequency.setTargetAtTime(f0, now, 1.0);
+      this.droneB.frequency.setTargetAtTime(f0*1.5, now, 1.0);
+      this.droneC.frequency.setTargetAtTime(f0*2, now, 1.0);
+      this.droneD.frequency.setTargetAtTime(f0*3, now, 1.0);
+    } catch (e) {}
+  },
+  bloom(feel, gain = 1) {                         // a soft swell, coloured by the feeling
+    if (!this.started || !this.ctx || this.muted) return; const ctx = this.ctx, now = ctx.currentTime;
+    try {
+      const penta = [0,3,5,7,10];
+      const idx = Math.abs(Math.floor(feel.energy*7 + feel.warmth*3)) % penta.length;
+      const octave = feel.weight > 0.6 ? -12 : feel.weight < 0.35 ? 12 : 0;
+      const base = lerp(150, 250, 1 - feel.warmth);
+      const freq = base * Math.pow(2, (penta[idx] + octave) / 12);
+      const dur = 2.4 + feel.weight*1.8 + (1 - feel.energy)*1.2;
+      const g = ctx.createGain(); g.gain.value = 0.0001;
+      const lp = ctx.createBiquadFilter(); lp.type = "lowpass";
+      lp.frequency.value = clamp(500 + feel.lumin*2600 + feel.energy*900, 220, 7000);
+      g.connect(lp); lp.connect(this.master); lp.connect(this.conv);
+      const o1 = ctx.createOscillator(); o1.type = "sine";     o1.frequency.value = freq;
+      const o2 = ctx.createOscillator(); o2.type = "triangle"; o2.frequency.value = freq*1.5;
+      const o2g = ctx.createGain(); o2g.gain.value = 0.18; o2.connect(o2g); o2g.connect(g); o1.connect(g);
+      const peak = (0.09 + 0.09*feel.lumin) * gain;
+      g.gain.setValueAtTime(0.0001, now);
+      g.gain.exponentialRampToValueAtTime(peak, now + 0.4);   // slow swell
+      g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+      o1.start(now); o2.start(now); o1.stop(now + dur + 0.1); o2.stop(now + dur + 0.1);
+    } catch (e) {}
+  },
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.master && this.ctx) { const now = this.ctx.currentTime;
+      this.master.gain.setTargetAtTime(this.muted ? 0.0001 : 0.5, now, 0.2); }
+    return this.muted;
+  }
+};
+function updateSoundBtn() {
+  const b = document.getElementById("snd"); if (!b) return;
+  if (!Sound.started) { b.textContent = "\u266A sound"; b.classList.remove("on"); }
+  else if (Sound.muted) { b.textContent = "\u266A off"; b.classList.remove("on"); }
+  else { b.textContent = "\u266A on"; b.classList.add("on"); }
+}
+
+/* ================================================================== */
+function setup() {
+  const c = createCanvas(windowWidth, windowHeight);
+  c.style("display", "block");
+  pixelDensity(Math.min(2, window.devicePixelRatio || 1));
+  noiseDetail(3, 0.5);
+  startT = millis(); bootT = millis();
+  seedMotes();
+  makeGrain();
+  setupInput();
+  const btn = document.getElementById("snd");
+  btn.addEventListener("click", () => { Sound.init(); Sound.resume(); Sound.toggleMute(); updateSoundBtn(); });
+  updateSoundBtn();
+  startSoundASAP();          // the water is already sounding when it opens
+  if (document.fonts && document.fonts.load) {
+    ["300","400","500","600"].forEach(w => document.fonts.load(`${w} 40px "Comfortaa"`));
+    document.fonts.load(`400 40px "Varela Round"`);
+  }
+}
+function windowResized() { resizeCanvas(windowWidth, windowHeight); seedMotes(); }
+
+function seedMotes() {
+  motes = [];
+  const n = Math.round((width*height)/18000);
+  for (let i=0;i<n;i++)
+    motes.push({ x:random(width), y:random(height), r:random(0.4,2.0), fall:random(3,12), tw:random(TWO_PI), bright:random()<0.10 });
+}
+
+/* ---- input ---- */
+function firstGesture() { Sound.init(); Sound.resume(); updateSoundBtn(); }
+
+/* Have the water already sounding when the piece opens. Browsers block
+   audio until a page has been interacted with, so we start it straight
+   away and, if the context comes up suspended, let the very next thing
+   the person does — a moved mouse, a key, a scroll — bring it in. No
+   click on the toggle needed. */
+function startSoundASAP() {
+  Sound.init(); Sound.resume(); updateSoundBtn();
+  const ready = () => Sound.ctx && Sound.ctx.state === "running";
+  if (ready()) return;
+  const evts = ["pointerdown","pointermove","mousemove","touchstart","keydown","wheel","scroll","click"];
+  const wake = () => {
+    Sound.init(); Sound.resume(); updateSoundBtn();
+    if (ready()) {
+      evts.forEach(e => window.removeEventListener(e, wake, true));
+      document.removeEventListener("visibilitychange", wake);
+      clearInterval(iv);
+    }
+  };
+  evts.forEach(e => window.addEventListener(e, wake, true));
+  document.addEventListener("visibilitychange", wake);
+  // keep trying quietly for a while, in case the browser relents
+  let tries = 0;
+  const iv = setInterval(() => { wake(); if (++tries > 40) clearInterval(iv); }, 500);
+}
+
+function setupInput() {
+  composer = document.getElementById("composer");
+  const focus = () => { try { composer.focus({ preventScroll:true }); } catch (e) { composer.focus(); } };
+  focus();
+  window.addEventListener("pointerdown", () => { firstGesture(); focus(); });
+  composer.addEventListener("input", () => { composing = composer.value; });
+  composer.addEventListener("keydown", (e) => {
+    firstGesture();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const line = composer.value.trim();
+      composer.value = ""; composing = "";
+      if (line) releaseLine(line); else clearField();
+    } else if (e.key === "Escape") {
+      e.preventDefault(); composer.value = ""; composing = ""; clearField();
+    }
+  });
+}
+
+/* ---- analysis: the sound of a word ---- */
+function analyzeWord(raw) {
+  const word = (raw.toLowerCase().replace(/[^a-z']/g, "")) || raw.toLowerCase();
+  let phones = [], sylCount = 1, stressRatio = 0.5, pos = "", ok = false;
+  if (RITA_OK) {
+    try {
+      const a = RiTa.analyze(word);
+      if (a && a.phones) {
+        phones = a.phones.replace(/\//g, "-").split("-").filter(Boolean);
+        sylCount = a.syllables ? a.syllables.split("/").length : 1;
+        const st = (a.stresses || "").split(/[\/\s]+/).filter(s => s.length);
+        if (st.length) stressRatio = st.filter(s => s.includes("1")).length / st.length;
+        pos = ((a.pos || "").split(/\s+/)[0]) || ""; ok = true;
+      }
+    } catch (e) {}
+  }
+  if (!ok) { sylCount = Math.max(1, (word.match(/[aeiouy]+/g) || []).length); stressRatio = 1/sylCount; phones = word.split(""); }
+  let v=0,p=0,f=0,n=0,l=0,tot=0;
+  for (const ph of phones) {
+    tot++;
+    if (ok) { if (VOWELS.has(ph)) v++; else if (PLOS.has(ph)) p++; else if (FRIC.has(ph)) f++; else if (NAS.has(ph)) n++; else if (LIQ.has(ph)) l++; else f++; }
+    else { if ("aeiou".includes(ph)) v++; else if ("pbtdkgcqxj".includes(ph)) p++; else if ("mn".includes(ph)) n++; else if ("lrwy".includes(ph)) l++; else f++; }
+  }
+  tot = Math.max(1, tot);
+  const vowel=v/tot, plos=p/tot, fric=f/tot, nas=n/tot, liq=l/tot;
+  const w_weight = clamp(plos*0.7 + stressRatio*0.3);
+  const w_flow   = clamp(liq*0.55 + vowel*0.4 + nas*0.3);
+  const w_hiss   = clamp(fric*0.9 + nas*0.2);
+  const bold = clamp(0.45*w_weight + 0.20*stressRatio - 0.18*w_hiss);
+  return { sylCount, pos, vowel, plos, fric, nas, liq, w_weight, w_flow, w_hiss, bold };
+}
+
+/* ---- the feeling of a word: sound, tinted by any affective meaning -- */
+function wordFeeling(raw, F) {
+  const b = {
+    warmth: clamp(0.5 + F.vowel*0.4 + F.w_flow*0.25 - F.plos*0.55),
+    energy: clamp(0.2 + F.w_weight*0.6 + F.plos*0.2),
+    lumin:  clamp(0.45 + F.w_flow*0.3 + F.w_hiss*0.2 - F.plos*0.2),
+    weight: clamp(0.4 + F.plos*0.5 + F.bold*0.2 - F.vowel*0.3),
+    sat:    clamp(0.32 + F.w_weight*0.2)
+  };
+  let hue = lerp(228, 44, b.warmth);
+  if (b.energy > 0.5) hue = lerpHue(hue, 12, clamp((b.energy - 0.5) * 0.7));
+  const a = AFFECT[raw.toLowerCase().replace(/[^a-z]/g, "")];
+  if (a) {
+    if (a.hue != null) hue = a.hue;
+    for (const k of ["warmth","energy","lumin","weight","sat"]) if (a[k] != null) b[k] = lerp(b[k], a[k], 0.78);
+  }
+  return { hue, warmth:b.warmth, energy:b.energy, lumin:b.lumin, weight:b.weight,
+           sat: 20 + b.sat*52, light: 40 + b.lumin*32 };
+}
+
+/* Each released line gets its own anchor somewhere in the frame, rather
+   than always surfacing at the middle — so the field fills instead of
+   clustering. A line's words sit near their anchor, then drift apart. */
+function lineAnchor(soft) {
+  if (soft < 1) {                       // ambient lines: anywhere in the water
+    return { ax: random(width*0.16, width*0.84),
+             ay: random(height*0.14, height*0.82) };
+  }
+  // what the person typed surfaces nearer the middle, but still wanders
+  return { ax: random(width*0.26, width*0.74),
+           ay: random(height*0.30, height*0.70) };
+}
+
+function releaseLine(line, soft = 1) {
+  const toks = line.split(/\s+/).filter(Boolean).slice(0, 24);
+  const n = toks.length;
+  const { ax, ay } = lineAnchor(soft);
+  const gapX = Math.min(130, (width*0.34)/Math.max(1,n));
+  toks.forEach((tok, i) => {
+    const dx = (i - (n-1)/2)*gapX + random(-18,18);
+    const dy = random(-height*0.05, height*0.05);
+    setTimeout(() => commitWord(tok, ax + dx, ay + dy, soft), i*150);
+  });
+}
+
+function commitWord(raw, px, py, soft = 1) {
+  const display = raw.slice(0, 24);
+  const F = analyzeWord(display);
+  const feel = wordFeeling(display, F);
+  if (px == null) px = random(width*0.2, width*0.8);
+  if (py == null) py = random(height*0.2, height*0.8);
+  const x = clamp(px, width*0.07, width*0.93);
+  const y = clamp(py, height*0.09, height*0.9);
+  lastCommitT = tSec;
+
+  const key = display.toLowerCase().replace(/[^a-z']/g, "");
+  freq[key] = (freq[key] || 0) + 1;
+  const n = freqWeight(key, freq[key]);
+  const mine = soft >= 1;                 // the person typed this one
+
+  // A word already in the water is never written twice. The repetition
+  // feeds the one that is there: it grows, clears, and its life renews.
+  // So "sea" and "water" deepen as the poem returns to them instead of
+  // crowding the field with copies.
+  const standing = inks.find(k => k.key === key && !k.dead && k.age < k.hold);
+  if (standing) {
+    standing.reinforce(n);
+    stains.push(new Stain(x, y, feel, F, soft, n));
+    if (stains.length > 60) { const s = stains.find(s => s.dieAt == null); if (s) s.kill(5); }
+    Sound.bloom(feel, mine ? 1.25 : 0.42);
+    lightSurge = Math.min(1.4, lightSurge + (mine ? 0.5 : 0.28));   // each word lifts the light
+  } else {
+    inks.push(new Ink(display, x, y, feel, F, soft, n));
+    if (inks.length > 70) { for (const k of inks) { if (k.age < k.hold) { k.hurry(); break; } } }
+    stains.push(new Stain(x, y, feel, F, soft, n));
+    if (stains.length > 60) { const s = stains.find(s => s.dieAt == null); if (s) s.kill(5); }
+    Sound.bloom(feel, mine ? 1.25 : 0.42);
+    lightSurge = Math.min(1.4, lightSurge + (mine ? 0.5 : 0.28));   // each word lifts the light
+  }
+
+  const k = 0.42;
+  target.warmth = lerp(target.warmth, feel.warmth, k);
+  target.energy = lerp(target.energy, feel.energy, k);
+  target.lumin  = lerp(target.lumin,  feel.lumin,  k);
+  target.weight = lerp(target.weight, feel.weight, k);
+  target.hue    = lerpHue(target.hue, feel.hue, 0.55);
+  firstCommit = true;
+  if (mine) userSaid = true;
+}
+
+function clearField() {                            // let the water settle back into the dark
+  for (const s of stains) s.kill(random(3, 6));
+  for (const i of inks) i.age = Math.max(i.age, i.life - 1.6);
+  for (const k in REST) target[k] = REST[k];
+}
+
+/* ================================================================== *
+ *  STAIN — a soak-stain bloom of colour
+ * ================================================================== */
+class Stain {
+  constructor(x, y, feel, F, soft = 1, freqN = 1) {
+    this.x = x; this.y = y;
+    this.hue = feel.hue; this.sat = feel.sat; this.light = feel.light;
+    this.r = md()*0.015;
+    this.rTarget = md()*(0.12 + Math.min(4,F.sylCount)*0.022 + feel.energy*0.12)*random(0.85,1.2)*(0.9 + Math.min(freqN,6)*0.04);
+    this.age = 0; this.life = random(40,68);
+    this.seed = random(1000);
+    this.vx = random(-0.15,0.15);
+    this.vy = 0;
+    this.sink = (feel.weight - 0.45)*0.35;
+    this.coreA = (0.14 + feel.lumin*0.20)*soft*(soft >= 1 ? 1 : 0.8);
+    this.wobble = 0.10 + F.w_hiss*0.16;            // sibilant words spread a little more raggedly
+    this.dieAt = null; this.dieDur = 1;
+    this.M = 22; this.offs = []; for (let i=0;i<this.M;i++) this.offs.push(random(-1,1));
+  }
+  kill(dur) { if (this.dieAt == null) { this.dieAt = this.age + dur; this.dieDur = dur; } }
+  update(dt, turb) {
+    this.age += dt;
+    this.r = lerp(this.r, this.rTarget, 0.02);
+    const s = 0.0011, ang = noise(this.x*s, this.y*s, tSec*0.03)*TWO_PI*2;
+    this.vx = lerp(this.vx, Math.cos(ang)*turb*0.55, 0.03);
+    this.vy = lerp(this.vy, Math.sin(ang)*turb*0.4 + this.sink, 0.03);
+    const dts = dt*60; this.x += this.vx*dts; this.y += this.vy*dts;
+    const m = this.r*1.4;
+    if (this.x < -m) this.x = width+m; else if (this.x > width+m) this.x = -m;
+    if (this.y > height+m) { this.y = -m; } else if (this.y < -m) this.y = height+m;
+  }
+  get alpha() {
+    let a = clamp(this.age/2.6)*clamp((this.life-this.age)/6);
+    if (this.dieAt != null) a *= clamp((this.dieAt-this.age)/this.dieDur);
+    return a;
+  }
+  get dead() { return this.age > this.life || (this.dieAt != null && this.age >= this.dieAt); }
+  draw(ctx) {
+    const a = this.alpha; if (a <= 0.004) return;
+    const R = this.r;
+    ctx.save();
+    ctx.globalCompositeOperation = "screen";
+    const g = ctx.createRadialGradient(this.x, this.y, 0, this.x, this.y, R);
+    g.addColorStop(0.0, hsla(this.hue, this.sat, this.light, this.coreA*a));
+    g.addColorStop(0.32, hsla(this.hue, this.sat, this.light*0.96, this.coreA*a*0.62));
+    g.addColorStop(0.62, hsla(this.hue, this.sat, this.light*0.9, this.coreA*a*0.24));
+    g.addColorStop(0.84, hsla(this.hue, this.sat, this.light*0.86, this.coreA*a*0.07));
+    g.addColorStop(1.0, hsla(this.hue, this.sat, this.light, 0));
+    ctx.fillStyle = g;
+
+    // a soft, closed curve through the bloom's drifting points — no hard edge
+    const M = this.M, pts = [];
+    for (let i=0;i<M;i++) {
+      const th = (i/M)*TWO_PI;
+      const nz = noise(this.seed + Math.cos(th)*0.9, this.seed + Math.sin(th)*0.9 + tSec*0.05);
+      const rr = R*(1 + (nz-0.5)*this.wobble*2 + this.offs[i]*0.05);
+      pts.push({ x: this.x + Math.cos(th)*rr, y: this.y + Math.sin(th)*rr*0.92 });
+    }
+    ctx.beginPath();
+    const mx = (pts[M-1].x + pts[0].x)/2, my = (pts[M-1].y + pts[0].y)/2;
+    ctx.moveTo(mx, my);
+    for (let i=0;i<M;i++) {          // quadratics through midpoints = continuous, seamless curve
+      const p = pts[i], q = pts[(i+1)%M];
+      ctx.quadraticCurveTo(p.x, p.y, (p.x+q.x)/2, (p.y+q.y)/2);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+/* ================================================================== *
+ *  INK — a word, surfacing then bleeding into the water
+ * ================================================================== */
+class Ink {
+  constructor(text, x, y, feel, F, soft = 1, freqN = 1) {
+    this.text = text; this.x = x; this.y = y; this.hue = feel.hue;
+    this.key = text.toLowerCase().replace(/[^a-z']/g, "");
+    this.age = 0;
+    const mine = soft >= 1;                          // the person typed this one
+    // what the person typed holds the water; what the deep murmurs on
+    // its own stays smaller, fainter, and passes through more quickly
+    this.hold  = mine ? 20 + Math.min(4, F.sylCount)*1.2
+                      : 9  + Math.min(4, F.sylCount)*0.6;
+    this.bleed = mine ? 9 : 5.5;
+    this.life = this.hold + this.bleed;
+    this.sylCount = F.sylCount;
+    this.soft = soft;
+    // both voices vary word to word — the deep's widely, since it is
+    // only light; the person's around a much larger centre
+    this.scale = mine ? random(1.25, 1.95) : random(0.34, 1.05);
+    this.mine = mine;
+    this.setWeight(freqN);
+    this.vx = random(-0.08,0.08); this.vy = 0;
+    this.sink = (feel.weight - 0.5)*0.12;
+    this.seed = random(1000);
+    // each word carries a slow push away from where its line surfaced,
+    // so a phrase opens outward instead of staying a knot
+    const spreadAng = random(TWO_PI), spreadMag = random(0.10, 0.26);
+    this.sx = Math.cos(spreadAng)*spreadMag;
+    this.sy = Math.sin(spreadAng)*spreadMag*0.7;
+  }
+  setWeight(freqN) {
+    this.freqN = freqN;
+    const fscale = 0.82 + Math.min(freqN, 9)*0.085;   // the more a word recurs, the larger it grows
+    this.sizeTarget = clamp(md()*0.024 * map(this.sylCount,1,5,0.95,1.3,true) * fscale * (this.scale || 1),
+                            11, md()*0.13);
+    if (this.size == null) this.size = this.sizeTarget;
+    this.freqAlpha = clamp(0.58 + Math.min(freqN, 9)*0.06);    // and the clearer it becomes
+  }
+  /* the poem has returned to this word: let it swell, clear, and begin
+     its life again rather than writing a second copy of it */
+  reinforce(freqN) {
+    this.setWeight(Math.max(this.freqN, freqN) + 0.8);
+    this.age = Math.min(this.age, Math.max(0.5, this.hold*0.25));
+  }
+  get dead() { return this.age > this.life; }
+  /* how present this word is right now, 0..1 — rises as it surfaces,
+     holds, falls away as it bleeds. The light above reads this. */
+  get presence() {
+    if (this.age < 0.5) return clamp(this.age/0.5);
+    if (this.age < this.hold) return 1;
+    return Math.pow(clamp((this.life - this.age)/this.bleed), 1.3);
+  }
+  hurry() { if (this.age < this.hold) this.age = this.hold; }   // send an old one into its bleed early
+  update(dt, turb) {
+    this.age += dt;
+    this.size = lerp(this.size, this.sizeTarget, 0.03);   // swells when reinforced
+    const s = 0.0013, ang = noise(this.x*s + this.seed, this.y*s, tSec*0.03)*TWO_PI*2;
+    // the outward push eases off as the word settles into the water
+    const spread = Math.exp(-this.age/9);
+    this.vx = lerp(this.vx, Math.cos(ang)*turb*0.12 + this.sx*spread, 0.02);
+    this.vy = lerp(this.vy, Math.sin(ang)*turb*0.08 + this.sink + this.sy*spread, 0.02);
+    this.x += this.vx*dt*60; this.y += this.vy*dt*60;
+    // keep a drifting word from sliding off into nothing
+    const m = md()*0.05;
+    this.x = constrain(this.x, m, width - m);
+    this.y = constrain(this.y, m, height - m);
+  }
+  draw(ctx) {
+    let a;
+    if (this.age < 0.5) a = clamp(this.age/0.5);          // surface
+    else if (this.age < this.hold) a = 1;                 // hold, legible
+    else a = Math.pow(clamp((this.life - this.age)/this.bleed), 1.3);   // bleed away
+    a *= (this.mine ? 1 : 0.8) * this.soft * this.freqAlpha; if (a <= 0.01) return;
+    const p = this.age < this.hold ? 0 : clamp((this.age - this.hold)/this.bleed);
+    const blur = 3 + p*p*15;                              // the letters run only as they finally fade
+
+    // The word goes one way only: the letters drift apart from each
+    // other, wider and wider, and dim as they go. Nothing twitches,
+    // nothing drops out, nothing doubles.
+    ctx.save(); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = `500 ${this.size}px "Comfortaa", "Varela Round", system-ui, sans-serif`;
+    ctx.shadowBlur = this.mine ? blur : blur*0.6;
+    ctx.shadowColor = this.mine ? hsla(278, 46, 62, a*0.85) : hsla(this.hue, 50, 70, a*0.5);
+    // what the person typed is solid, and carries a grey-violet cast of
+    // its own; what the deep murmurs stays pale and almost colourless
+    ctx.fillStyle = this.mine ? hsla(276, 20, 89, a) : hsla(this.hue, 16, 93, a);
+    const track = (0.04 + p*p*2.6) * this.size;      // px between letters
+    const y = this.y - p*10;
+    if (LETTER_SPACING_OK) ctx.letterSpacing = `${track.toFixed(2)}px`;
+
+    /* Rough letterforms: the word is stamped on a scratch canvas, the
+       grain is punched out of the glyphs there, and the worn result is
+       laid down as one piece. Nothing is subtracted from the water. */
+    let drawn = false;
+    if (ERODE_OK && this.size > 11) {
+      const pad = this.size * 1.6;
+      const w = Math.ceil(Math.min(width*1.5, this.size*this.text.length*1.1 + track*this.text.length + pad*2));
+      const h = Math.ceil(this.size*2.2 + pad);
+      const ec = erodeCanvas(w, h);
+      if (ec) {
+        const g = ec.ctx, cx = w/2, cy = h/2;
+        g.save();
+        g.setTransform(1,0,0,1,0,0);
+        g.clearRect(0, 0, ec.el.width, ec.el.height);
+        g.textAlign = "center"; g.textBaseline = "middle";
+        g.font = ctx.font;
+        if (LETTER_SPACING_OK) { try { g.letterSpacing = `${track.toFixed(2)}px`; } catch (e) {} }
+        g.fillStyle = "#fff";
+        if (LETTER_SPACING_OK) g.fillText(this.text, cx, cy);
+        else spacedText(g, this.text, cx, cy, track);
+        // eat speckled holes out of the strokes
+        g.globalCompositeOperation = "destination-out";
+        const mk = erodeMask(this.seed);
+        g.globalAlpha = this.mine ? 0.34 : 0.44;    // the deep's words wear away more
+        g.drawImage(mk, 0, 0, w, h);
+        // tint what survives
+        g.globalAlpha = 1;
+        g.globalCompositeOperation = "source-in";
+        g.fillStyle = this.mine ? hsla(276, 20, 89, 1) : hsla(this.hue, 16, 93, 1);
+        g.fillRect(0, 0, w, h);
+        g.restore();
+
+        ctx.globalAlpha = a;
+        ctx.drawImage(ec.el, 0, 0, w, h, this.x - cx, y - cy, w, h);
+        ctx.globalAlpha = 1;
+        drawn = true;
+      }
+    }
+    if (!drawn) {                                   // small words stay clean
+      if (LETTER_SPACING_OK) ctx.fillText(this.text, this.x, y);
+      else spacedText(ctx, this.text, this.x, y, track);
+    }
+    ctx.restore();
+  }
+}
+
+/* ================================================================== *
+ *  DRAW LOOP
+ * ================================================================== */
+function draw() {
+  const dt = Math.min(0.05, (deltaTime || 16)/1000);
+  if (!pieceBegun) {
+    const sounding = Sound.ctx && Sound.ctx.state === "running";
+    // begin when the sound does — or on our own, if it never arrives
+    if (sounding || Sound.muted || millis() - bootT > 5000) pieceBegun = true;
+    else startT = millis();                 // hold the clock at zero
+  }
+  tSec = (millis() - startT)/1000;
+  const ctx = drawingContext;
+
+  mood.warmth = lerp(mood.warmth, target.warmth, 0.02);
+  mood.energy = lerp(mood.energy, target.energy, 0.02);
+  mood.lumin  = lerp(mood.lumin,  target.lumin,  0.02);
+  mood.weight = lerp(mood.weight, target.weight, 0.02);
+  mood.hue    = lerpHue(mood.hue, target.hue, 0.02);
+  for (const k of ["warmth","energy","lumin","weight"]) target[k] = lerp(target[k], REST[k], 0.0018);
+  target.hue = lerpHue(target.hue, REST.hue, 0.0018);
+  Sound.setMood(mood);
+
+  // the light follows the words: sum how much word is currently present
+  let presenceSum = 0;
+  for (const k of inks) presenceSum += k.presence;
+  const lightTarget = 1 - Math.exp(-presenceSum/9);
+  // rises a little quicker than it falls, so arrivals feel like a swell
+  lightNow = lerp(lightNow, lightTarget, lightTarget > lightNow ? 0.035 : 0.025);
+  lightSurge = Math.max(0, lightSurge - dt*0.5);
+
+  if (tSec > 13 && tSec - lastCommitT > 5.5 && tSec - lastAmbientT > ambientGap && AMBIENT.length) {
+    lastAmbientT = tSec; ambientGap = random(6, 11);
+    releaseLine(AMBIENT[Math.floor(random(AMBIENT.length))], 0.78);
+  }
+
+  const turb = REDUCED ? 0.2 : (0.3 + 0.9*mood.energy);
+
+  drawBackground(ctx);
+  drawVeils(ctx);
+
+  for (let i = stains.length-1; i>=0; i--) { const s = stains[i]; s.update(dt, turb); s.draw(ctx); if (s.dead) stains.splice(i,1); }
+
+  drawMotes(ctx, dt, turb);
+
+  for (let i = inks.length-1; i>=0; i--) { const k = inks[i]; k.update(dt, turb); k.draw(ctx); if (k.dead) inks.splice(i,1); }
+
+  drawComposing(ctx);
+  drawWhisperAndHint(ctx);
+  drawVignette(ctx);
+  drawGrain(ctx);        // a fine film grain over everything
+}
+
+/* smooth water again, with the round glow falling from far above */
+function drawBackground(ctx) {
+  const h = mood.hue, dark = clamp(0.45 + 0.4*mood.weight - 0.2*mood.lumin);
+  const g = ctx.createLinearGradient(0,0,0,height);
+  g.addColorStop(0.0, hsla(h, 34, lerp(11,6,dark), 1));
+  g.addColorStop(0.5, hsla(h, 30, lerp(6.5,3.5,dark), 1));
+  g.addColorStop(1.0, hsla(h+8, 26, 2.6, 1));
+  ctx.fillStyle = g; ctx.fillRect(0,0,width,height);
+  // the round light from far above — it belongs to the words, so it
+  // gathers as they surface and goes out with them
+  const lit = clamp(lightNow + lightSurge*0.5);
+  const cx = width/2;
+  const reach = height * (0.8 + 0.45*lit);
+  const rg = ctx.createRadialGradient(cx,-height*0.28,0,cx,-height*0.28,reach);
+  const peak = (0.03 + 0.42*lit) * (1 - dark*0.55);
+  rg.addColorStop(0,    hsla(h, 34, 24, peak));
+  rg.addColorStop(0.45, hsla(h, 34, 23, peak*0.42));
+  rg.addColorStop(1,    hsla(h, 34, 22, 0));
+  ctx.fillStyle = rg; ctx.fillRect(0,0,width,height);
+}
+
+/* ---- GRAIN ---------------------------------------------------------
+   A few tiles of hard static, pre-baked, then thrown over the whole
+   frame at a random offset each tick. This is what keeps the piece from
+   looking rendered: everything sits under the same dirty film.        */
+let grainTiles = [], grainHold = 0, grainIdx = 0;
+function makeGrain() {
+  grainTiles = [];
+  const S = 200, PX = 2;          // grain clumped at PX size: coarse, not fine
+  const s = Math.ceil(S / PX);
+  for (let t = 0; t < 4; t++) {
+    const small = document.createElement("canvas");
+    small.width = small.height = s;
+    const sg = small.getContext("2d");
+    const img = sg.createImageData(s, s);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const v = Math.random();
+      const l = v > 0.97 ? 225 : v > 0.86 ? 150 : v < 0.1 ? 10 : 70;
+      d[i] = d[i+1] = d[i+2] = l;
+      d[i+3] = (v > 0.86 || v < 0.1) ? 225 : 120;
+    }
+    sg.putImageData(img, 0, 0);
+    // blow it up with no smoothing so each grain is a hard square
+    const c = document.createElement("canvas");
+    c.width = c.height = S;
+    const g = c.getContext("2d");
+    g.imageSmoothingEnabled = true;     // soft clumps, not hard pixels
+    g.drawImage(small, 0, 0, S, S);
+    grainTiles.push(c);
+  }
+}
+function drawGrain(ctx) {
+  if (!grainTiles.length) return;
+  grainHold -= 1;
+  if (grainHold <= 0) { grainIdx = (grainIdx + 1 + Math.floor(Math.random()*3)) % grainTiles.length; grainHold = 2; }
+  const tile = grainTiles[grainIdx], S = tile.width;
+  ctx.save();
+  ctx.globalCompositeOperation = "overlay";
+  ctx.globalAlpha = 0.34;
+  const ox = -Math.floor(Math.random()*S), oy = -Math.floor(Math.random()*S);
+  for (let x = ox; x < width; x += S)
+    for (let y = oy; y < height; y += S) ctx.drawImage(tile, x, y);
+  ctx.restore();
+}
+
+
+function drawVeils(ctx) {                           // broad, faint colour-field washes
+  ctx.save(); ctx.globalCompositeOperation = "screen";
+  for (let i=0;i<2;i++) {
+    const px = width*(0.25 + 0.5*noise(i*11.7, tSec*0.015));
+    const py = height*(0.28 + 0.5*noise(i*11.7+5, tSec*0.015));
+    const R = md()*0.85;
+    const h = mood.hue + (i ? 26 : -22);
+    const g = ctx.createRadialGradient(px,py,0,px,py,R);
+    g.addColorStop(0, hsla(h, 28, 32, 0.05 + 0.05*mood.lumin));
+    g.addColorStop(1, hsla(h, 28, 32, 0));
+    ctx.fillStyle = g; ctx.fillRect(0,0,width,height);
+  }
+  ctx.restore();
+}
+
+function drawMotes(ctx, dt, turb) {
+  ctx.save();
+  for (let i = motes.length-1; i>=0; i--) {
+    const m = motes[i], s = 0.002, ang = noise(m.x*s, m.y*s, tSec*0.04)*TWO_PI*2;
+    m.x += Math.cos(ang)*turb*0.35*dt*60;
+    m.y += (m.fall*dt) + Math.sin(ang)*turb*0.18*dt*60;
+    if (m.y > height+4) { m.y = -4; m.x = random(width); }
+    if (m.x < -4) m.x = width+4; else if (m.x > width+4) m.x = -4;
+    let a = m.bright ? (0.28 + 0.34*Math.sin(tSec*1.1 + m.tw))*(0.5+mood.lumin) : 0.13;
+    a = clamp(a); if (a <= 0.01) continue;
+    if (m.bright) { ctx.shadowBlur = 5; ctx.shadowColor = hsla(mood.hue,55,74,a); } else ctx.shadowBlur = 0;
+    ctx.fillStyle = m.bright ? hsla(mood.hue,40,84,a) : hsla(mood.hue,20,66,a);
+    ctx.beginPath(); ctx.arc(m.x,m.y,m.r,0,TWO_PI); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawComposing(ctx) {
+  const x = width/2, y = height*0.78, size = clamp(md()*0.040, 20, 58), blink = Math.floor(tSec*1.5)%2 === 0;
+  ctx.save(); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  const txt = composing || "";
+  let fs = size; const maxW = width*0.86;
+  ctx.font = `400 ${fs}px "Comfortaa", "Varela Round", system-ui, sans-serif`;
+  const tw0 = ctx.measureText(txt).width;
+  if (tw0 > maxW && tw0 > 0) { fs = Math.max(13, size*maxW/tw0); ctx.font = `400 ${fs}px "Comfortaa", "Varela Round", system-ui, sans-serif`; }
+  try { ctx.letterSpacing = "0.04em"; } catch (e) {}
+  ctx.shadowBlur = 14; ctx.shadowColor = hsla(278,46,62,0.55);
+  ctx.fillStyle = hsla(276,20,83,0.95); ctx.fillText(txt, x, y);
+  const wpx = ctx.measureText(txt).width;
+  const caretX = x + wpx/2 + fs*0.10;
+  if (blink && txt) { ctx.shadowBlur = 8; ctx.fillStyle = hsla(276,26,78,0.7);
+    ctx.fillRect(caretX, y - fs*0.42, Math.max(1.2,fs*0.03), fs*0.84); }
+  // before anything has been said, the invitation waits — the cursor and
+  // the words centred together, so the whole line sits on the axis
+  if (!txt && !userSaid) {
+    const ps = fs*0.5;
+    ctx.font = `300 ${ps}px "Comfortaa", "Varela Round", system-ui, sans-serif`;
+    try { ctx.letterSpacing = "0.16em"; } catch (e) {}
+    const pw = ctx.measureText(PROMPT).width;
+    const gap = fs*0.34, cw = Math.max(1.2, fs*0.03);
+    const startX = x - (cw + gap + pw)/2;
+    if (blink) {                               // the caret, moved to the group
+      ctx.shadowBlur = 8; ctx.fillStyle = hsla(276,26,78,0.5);
+      ctx.fillRect(startX, y - fs*0.42, cw, fs*0.84);
+    }
+    ctx.textAlign = "left";
+    ctx.shadowBlur = 9; ctx.shadowColor = hsla(278,46,62,0.22);
+    ctx.fillStyle = hsla(276,16,84, 0.2 + 0.13*Math.sin(tSec*0.9));
+    ctx.fillText(PROMPT, startX + cw + gap, y);
+    ctx.textAlign = "center";
+  }
+  // the one instruction, shown only once and only while it is needed:
+  // something has been typed and has not yet been let go
+  if (txt && !userSaid) {
+    const hs = clamp(md()*0.019, 11, 19);
+    ctx.font = `400 ${hs}px "Comfortaa", "Varela Round", system-ui, sans-serif`;
+    try { ctx.letterSpacing = "0.2em"; } catch (e) {}
+    ctx.shadowBlur = 6; ctx.shadowColor = hsla(278,40,60,0.3);
+    ctx.fillStyle = hsla(276,16,80, 0.3 + 0.22*Math.sin(tSec*2.2));
+    ctx.fillText("\u21b5", x, y + fs*0.95);
+  }
+  ctx.restore();
+}
+
+function drawWhisperAndHint(ctx) {
+  ctx.save(); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+
+  /* The opening words sink. They surface high in the water, hold for a
+     breath, then fall away into the dark — gathering speed as they go,
+     the way something heavy goes down, the second line lagging behind
+     the first so the two come apart on the way down. */
+  const T_IN = 2.6, T_HOLD = 8.4, T_SINK = 8.6;
+  if (tSec < T_HOLD + T_SINK) {
+    const sink = clamp((tSec - T_HOLD)/T_SINK);
+    const fall = (REDUCED ? sink*0.22 : Math.pow(sink, 1.85)*0.80) * height;
+    let cy = height*0.26 + fall;
+    for (const line of OPENING) {
+      const sz = clamp(md()*line.size, 15, 56);
+      const a = Math.min(clamp((tSec - line.delay)/T_IN), Math.pow(1 - sink, 0.85));
+      if (a > 0.01) {
+        ctx.font = `300 ${sz}px "Comfortaa", "Varela Round", system-ui, sans-serif`;
+        try { ctx.letterSpacing = `${(0.10 + sink*0.5).toFixed(3)}em`; } catch (e) {}
+        ctx.shadowBlur = 20; ctx.shadowColor = hsla(mood.hue,55,60,0.42*a);
+        ctx.fillStyle = hsla(mood.hue,20,92,0.95*a);
+        // the lower lines drag, so the three come apart as they sink
+        ctx.fillText(line.text, width/2, cy + fall*line.drag);
+      }
+      cy += sz*1.5;
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawVignette(ctx) {
+  const cx = width/2, cy = height/2;
+  const g = ctx.createRadialGradient(cx,cy,md()*0.34,cx,cy,md()*0.92);
+  g.addColorStop(0,"rgba(0,0,0,0)"); g.addColorStop(1,"rgba(0,3,8,0.6)");
+  ctx.fillStyle = g; ctx.fillRect(0,0,width,height);
+}
+</script>
+</body>
+</html>
+
+</body></html>
